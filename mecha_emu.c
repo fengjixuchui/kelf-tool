@@ -54,64 +54,6 @@ static struct CryptoContext context;
 #include "keys.h"
 
 /*
- * meResetCryptoContext: reset the crypto context
- */
-void meResetCryptoContext(void)
-{
-	memset((void *)&context, 0, sizeof(struct CryptoContext));
-}
-
-/*
- * meCardCalcUniqueKey: calculate unique key for memory card authentication.
- */
-void meCardCalcUniqueKey(uint8_t *CardIV, uint8_t *CardMaterial)
-{
-	uint8_t Input[8];
-
-	memxor(CardIV, CardMaterial, Input, 8);
-
-	cipherCbcEncrypt(&context.UniqueKey[0], Input, 8, MC_CARDKEY_HASHKEY_1, 2, MC_CARDKEY_MATERIAL_1);
-	cipherCbcEncrypt(&context.UniqueKey[8], Input, 8, MC_CARDKEY_HASHKEY_2, 2, MC_CARDKEY_MATERIAL_2);
-
-	memcpy(context.CardIV, CardIV, 8);
-	memcpy(context.CardMaterial, CardMaterial, 8);
-}
-
-/*
- * meCardGenerateChallenge: generate challenge for memory card.
- */
-void meCardGenerateChallenge(uint8_t *CardIV, uint8_t *CardNonce, uint8_t *MechaNonce,
-                             uint8_t *MechaChallenge1, uint8_t *MechaChallenge2, uint8_t *MechaChallenge3)
-{
-	cipherCbcEncrypt(MechaChallenge1, MechaNonce, 8, context.UniqueKey, 2, MC_CHALLENGE_MATERIAL);
-	cipherCbcEncrypt(MechaChallenge2, CardNonce,  8, context.UniqueKey, 2, MechaChallenge1);
-	cipherCbcEncrypt(MechaChallenge3, CardIV,     8, context.UniqueKey, 2, MechaChallenge2);
-
-	memcpy(context.CardNonce, CardNonce, 8);
-	memcpy(context.MechaNonce, MechaNonce, 8);
-}
-
-/*
- * meCardVerifyResponse: verify response from memory card.
- */
-int meCardVerifyResponse(uint8_t *CardResponse1, uint8_t *CardResponse2, uint8_t *CardResponse3)
-{
-	uint8_t DecryptedResponse1[8], DecryptedResponse2[8], DecryptedResponse3[8];
-	int r = -1;
-
-	cipherCbcDecrypt(DecryptedResponse1, CardResponse1, 8, context.UniqueKey, 2, MC_CHALLENGE_MATERIAL);
-	cipherCbcDecrypt(DecryptedResponse2, CardResponse2, 8, context.UniqueKey, 2, CardResponse1);
-	cipherCbcDecrypt(DecryptedResponse3, CardResponse3, 8, context.UniqueKey, 2, CardResponse2);
-
-	if (!memcmp(DecryptedResponse1, context.CardNonce, 8) && !memcmp(DecryptedResponse2, context.MechaNonce, 8)) {
-		memcpy(context.SessionKey, DecryptedResponse3, 8);
-		r = 0;
-	}
-
-	return  r;
-}
-
-/*
  * meGetContentKeyOffset: calculate ContentKey offset in a kelf
  */
 int meGetContentKeyOffset(uint8_t *KelfHeader)
@@ -149,10 +91,25 @@ void meDecryptDiskContentKey(uint8_t *KelfHeader)
 {
 	int CK_offset;
 	uint8_t HeaderData[8];
+	uint32_t num_bitsignatures=0;
+	uint8_t signatures1[0x10];
 	
 	uint16_t flags = read_le_uint16(KelfHeader+0x18);
 
 	CK_offset = meGetContentKeyOffset(KelfHeader);
+	
+	uint8_t TheHeader[CK_offset-8];
+	cipherCbcEncrypt(TheHeader, KelfHeader, CK_offset-8, MG_SIG_MASTER_KEY, 1, MG_IV_NULL);
+	
+	uint8_t TheHeaderSignature[8];
+	memcpy(TheHeaderSignature, TheHeader + sizeof(TheHeader) - 8, 8);
+	cipherCbcDecrypt(TheHeaderSignature, TheHeaderSignature, 8, MG_SIG_HASH_KEY, 1, MG_IV_NULL);
+	cipherCbcEncrypt(TheHeaderSignature, TheHeaderSignature, 8, MG_SIG_MASTER_KEY, 1, MG_IV_NULL);
+
+	if(memcmp(TheHeaderSignature,KelfHeader+CK_offset-8,8)==0){
+		//printf("valid header signature!\n");
+		memcpy(signatures1,TheHeaderSignature,8);
+	}
 
 	/* calculate file keys necessary to decrypt Kbit and Kc from MG header */
 	
@@ -183,10 +140,44 @@ void meDecryptDiskContentKey(uint8_t *KelfHeader)
 
 	int i = 0;
 	int total_length=0;
+	
+	uint8_t hash[8];
+	memcpy(hash, &context.DecryptedKbit[0], 8);
+	if (memcmp(&context.DecryptedKbit[0], &context.DecryptedKbit[8], 8) != 0){
+		memxor(&context.DecryptedKbit[8], hash, hash, 8);
+	}
+
+	memxor(&context.DecryptedKc[0], hash, hash, 8);
+	if (memcmp(&context.DecryptedKc[0], &context.DecryptedKc[8], 8) != 0){
+		memxor(&context.DecryptedKc[8], hash, hash, 8);
+	}
+	
+	uint8_t bitTable[num_blocks*0x10+8];
+	memcpy(bitTable,KelfHeader + CK_offset + 0x20,num_blocks*0x10+8);
+	
+	for (int i = 0; i < num_blocks * 2 + 1; i++){
+		memxor(&((uint8_t*)& bitTable)[i * 8], hash, hash, 8);
+	}
+	
+	uint8_t MG_SIG_MASTER_AND_HASH_KEY[16];
+	memcpy(MG_SIG_MASTER_AND_HASH_KEY, MG_SIG_MASTER_KEY, 8);
+	memcpy(MG_SIG_MASTER_AND_HASH_KEY + 8, MG_SIG_HASH_KEY, 8);
+
+	uint8_t signature[8];
+	cipherCbcEncrypt(signature, hash, 8, MG_SIG_MASTER_AND_HASH_KEY, 2, MG_IV_NULL);
+	
+	if(memcmp(KelfHeader + data_start - 0x10,signature,8)==0){
+		//printf("bit signature valid!\n");
+		memcpy(signatures1+8,signature,8);
+	}else{
+		hexDump(signature,8);
+		hexDump(KelfHeader + data_start - 0x10, 8);
+	}
+	
 	for(i=0;i<num_blocks;i++){
 		BLOCK * block = (BLOCK*)(KelfHeader + CK_offset + 0x20 + 8 + (0x10 * i));
 		if(block->type == 3){
-			
+			num_bitsignatures++;
 			if (flags == 0x21C){
 				cipherCbcDecrypt(KelfHeader + data_start + total_length, KelfHeader + data_start + total_length, block->length, &context.DecryptedKc[0], 1, MG_IV_BLOCK);
 				
@@ -205,7 +196,7 @@ void meDecryptDiskContentKey(uint8_t *KelfHeader)
 				cipherCbcEncrypt(signature, signature, 8, MG_SIG_MASTER_AND_HASH_KEY, 1, MG_IV_NULL);
 			
 				if (memcmp(block->signature, signature, 8) == 0){
-					printf("valid signature!\n");
+					//printf("valid signature!\n");
 				}else{
 					hexDump(block->signature,8);
 					hexDump(signature,8);
@@ -229,7 +220,7 @@ void meDecryptDiskContentKey(uint8_t *KelfHeader)
 				cipherCbcEncrypt(signature, signature, 8, MG_SIG_MASTER_AND_HASH_KEY, 2, MG_IV_NULL);
 			
 				if (memcmp(block->signature, signature, 8) == 0){
-					printf("valid signature!\n");
+					//printf("valid signature!\n");
 				}else{
 					hexDump(block->signature,8);
 					hexDump(signature,8);
@@ -238,7 +229,39 @@ void meDecryptDiskContentKey(uint8_t *KelfHeader)
 		}
 		total_length=total_length+block->length;
 	}
+	uint8_t signatures2[num_bitsignatures*8];
+	uint8_t signatures3[sizeof(signatures1)+sizeof(signatures2)];
 	
+
+	int j = 0;
+	for (int i = 0; i < num_blocks; i++){
+		
+		BLOCK * block = (BLOCK*)(KelfHeader + CK_offset + 0x20 + 8 + (0x10 * i));
+		if(block->type == 0){
+			//do nothing
+		}else if(block->type == 2){
+			//do nothing
+		}else if(block->type == 3){
+			memcpy(signatures2+j*8,block->signature,8);
+			j++;
+		}
+		
+	}
+	
+	memcpy(signatures3,signatures1,0x10);
+	memcpy(signatures3+0x10,signatures2,num_bitsignatures*8);
+	
+	//hexDump(signatures3,sizeof(signatures3));
+	
+	cipherCbcEncrypt(signatures3, signatures3, sizeof(signatures3), MG_ROOTSIG_MASTER_KEY, 1, MG_IV_NULL);
+	
+	uint8_t ROOT [8];
+	
+	cipherCbcDecrypt(ROOT, &signatures3[sizeof(signatures3) - 8], 8, MG_ROOTSIG_HASH_KEY, 2, MG_IV_NULL);
+	
+	if(memcmp(ROOT,KelfHeader + data_start - 8,8)==0){
+		printf("I AM GROOT!\n");
+	}
 }
 
 /*
