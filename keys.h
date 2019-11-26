@@ -16,3 +16,5 @@ static const uint8_t MG_IV_CONTENT_TABLE[8]  = { /**/ };
 
 static const uint8_t MG_IV_BLOCK[8]          = { /**/ };
 
+static const uint8_t MG_SIG_MASTER_KEY[8]    = { /**/ };
+static const uint8_t MG_SIG_HASH_KEY[8]      = { /**/ };

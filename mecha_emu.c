@@ -39,6 +39,12 @@ struct Kelf_Header {
 	uint32_t mg_zones;
 } __attribute__((packed));
 
+typedef struct {
+	uint32_t length;
+	uint32_t type; //3 encrypted & signed 2 signed 0 raw
+	uint8_t signature[8];
+} BLOCK;
+
 static struct CryptoContext context;
 
 /*
@@ -143,33 +149,19 @@ void meDecryptDiskContentKey(uint8_t *KelfHeader)
 {
 	int CK_offset;
 	uint8_t HeaderData[8];
+	
+	uint16_t flags = read_le_uint16(KelfHeader+0x18);
 
 	CK_offset = meGetContentKeyOffset(KelfHeader);
 
 	/* calculate file keys necessary to decrypt Kbit and Kc from MG header */
 	
-	printf("KelfHeader\n");
-	hexDump(KelfHeader,8);
-	hexDump(&KelfHeader[8],8);
-	
 	memxor(KelfHeader, &KelfHeader[8], HeaderData, 8);
 	cipherCbcEncrypt(&context.FileKey[0], HeaderData, 8, MG_KBIT_MASTER_KEY, 2, MG_KBIT_MATERIAL);
 	cipherCbcEncrypt(&context.FileKey[8], HeaderData, 8, MG_KC_MASTER_KEY,   2, MG_KC_MATERIAL);	
-	
-	printf("Encrypted FileKey\n");
-	hexDump(&context.FileKey[0],8);
-	hexDump(&context.FileKey[8],8);
 
-	
 	memcpy(context.EncryptedKbit, &KelfHeader[CK_offset], 16);
 	memcpy(context.EncryptedKc, &KelfHeader[CK_offset+16], 16);
-	
-	printf("Encrypted KC\n");
-	hexDump(&context.EncryptedKc[0],8);
-	hexDump(&context.EncryptedKc[8],8);
-	printf("Encrypted Kbit\n");
-	hexDump(&context.EncryptedKbit[0],8);
-	hexDump(&context.EncryptedKbit[8],8);
 
 
 	/* finally Decrypt the ContentKey */
@@ -178,17 +170,75 @@ void meDecryptDiskContentKey(uint8_t *KelfHeader)
 	cipherCbcDecrypt(&context.DecryptedKc[0],   &context.EncryptedKc[0],   8, context.FileKey, 2, MG_IV_NULL);
 	cipherCbcDecrypt(&context.DecryptedKc[8],   &context.EncryptedKc[8],   8, context.FileKey, 2, MG_IV_NULL);
 
+	memcpy(&KelfHeader[CK_offset], context.DecryptedKbit , 16);
+	memcpy(&KelfHeader[CK_offset+16], context.DecryptedKc , 16);
+
+	cipherCbcDecrypt(KelfHeader + CK_offset + 0x20, KelfHeader + CK_offset + 0x20, 8, &context.DecryptedKbit[0], 2, MG_IV_CONTENT_TABLE);
 	
-	printf("Decrypted KC\n");
-	hexDump(&context.DecryptedKc[0],8);
-	hexDump(&context.DecryptedKc[8],8);
-	printf("Decrypted Kbit\n");
-	hexDump(&context.DecryptedKbit[0],8);
-	hexDump(&context.DecryptedKbit[8],8);
+	uint32_t data_start = read_le_uint32(KelfHeader + CK_offset + 0x20);
+	uint32_t num_blocks = read_le_uint32(KelfHeader + CK_offset + 0x24);
 	
+	cipherCbcEncrypt(KelfHeader + CK_offset + 0x20, KelfHeader + CK_offset + 0x20, 8 ,&context.DecryptedKbit[0], 2, MG_IV_CONTENT_TABLE);
+	cipherCbcDecrypt(KelfHeader + CK_offset + 0x20, KelfHeader + CK_offset + 0x20, 8 + (0x10 * num_blocks), &context.DecryptedKbit[0], 2, MG_IV_CONTENT_TABLE);
+
+	int i = 0;
+	int total_length=0;
+	for(i=0;i<num_blocks;i++){
+		BLOCK * block = (BLOCK*)(KelfHeader + CK_offset + 0x20 + 8 + (0x10 * i));
+		if(block->type == 3){
+			
+			if (flags == 0x21C){
+				cipherCbcDecrypt(KelfHeader + data_start + total_length, KelfHeader + data_start + total_length, block->length, &context.DecryptedKc[0], 1, MG_IV_BLOCK);
+				
+				uint8_t signature[8];
+				memset(signature, 0, 8);
+				
+				
+				for (int j = 0; j < block->length; j += 8){
+					memxor(KelfHeader + data_start + total_length + j, signature, signature, 8);
+				}
+			
+				uint8_t MG_SIG_MASTER_AND_HASH_KEY[16];
+				memcpy(MG_SIG_MASTER_AND_HASH_KEY, MG_SIG_MASTER_KEY, 8);
+				memcpy(MG_SIG_MASTER_AND_HASH_KEY + 8, MG_SIG_HASH_KEY, 8);
+				
+				cipherCbcEncrypt(signature, signature, 8, MG_SIG_MASTER_AND_HASH_KEY, 1, MG_IV_NULL);
+			
+				if (memcmp(block->signature, signature, 8) == 0){
+					printf("valid signature!\n");
+				}else{
+					hexDump(block->signature,8);
+					hexDump(signature,8);
+				}
+			}
+			else if (flags == 0x22C){
+				cipherCbcDecrypt(KelfHeader + data_start + total_length, KelfHeader + data_start + total_length, block->length, &context.DecryptedKc[0], 2, MG_IV_BLOCK);
+				
+				uint8_t signature[8];
+				memset(signature, 0, 8);
+				
+				
+				for (int j = 0; j < block->length; j += 8){
+					memxor(KelfHeader + data_start + total_length + j, signature, signature, 8);
+				}
+			
+				uint8_t MG_SIG_MASTER_AND_HASH_KEY[16];
+				memcpy(MG_SIG_MASTER_AND_HASH_KEY, MG_SIG_MASTER_KEY, 8);
+				memcpy(MG_SIG_MASTER_AND_HASH_KEY + 8, MG_SIG_HASH_KEY, 8);
+				
+				cipherCbcEncrypt(signature, signature, 8, MG_SIG_MASTER_AND_HASH_KEY, 2, MG_IV_NULL);
+			
+				if (memcmp(block->signature, signature, 8) == 0){
+					printf("valid signature!\n");
+				}else{
+					hexDump(block->signature,8);
+					hexDump(signature,8);
+				}
+			}
+		}
+		total_length=total_length+block->length;
+	}
 	
-	cipherCbcDecrypt(KelfHeader + 0x48, KelfHeader + 0x48, 0x358, &context.DecryptedKbit[0], 2, MG_IV_CONTENT_TABLE);
-	cipherCbcDecrypt(KelfHeader + 0x3B0, KelfHeader + 0x3C0, 0x380, &context.DecryptedKc[0], 2, MG_IV_BLOCK);
 }
 
 /*
